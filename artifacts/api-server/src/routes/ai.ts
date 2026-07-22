@@ -4,18 +4,27 @@ const router: IRouter = Router();
 
 /* ---- Which providers are configured ---- */
 function getAvailableProviders(): string[] {
+  const hasOR = !!process.env.OPENROUTER_API_KEY;
   const out: string[] = [];
-  if (process.env.ANTHROPIC_API_KEY) out.push("anthropic");
-  if (process.env.OPENAI_API_KEY) out.push("openai");
+  // anthropic and openai route through OpenRouter when direct keys have no credits
+  if (process.env.ANTHROPIC_API_KEY || hasOR) out.push("anthropic");
+  if (process.env.OPENAI_API_KEY || hasOR) out.push("openai");
   if (process.env.GEMINI_API_KEY) out.push("gemini");
-  if (process.env.GROK_API_KEY) out.push("groq");   // xAI Grok (OpenAI-compat)
-  if (process.env.OPENROUTER_API_KEY) out.push("openrouter");
+  if (process.env.GROK_API_KEY) out.push("groq");
+  if (hasOR) out.push("openrouter");
   return out;
 }
 
 router.get("/providers", (_req, res) => {
   res.json({ available: getAvailableProviders() });
 });
+
+/* ---- Helpers ---- */
+
+// Prepend a provider prefix for OpenRouter if the model id has no slash.
+function orModel(provider: string, model: string): string {
+  return model.includes("/") ? model : `${provider}/${model}`;
+}
 
 /* ---- AI proxy ---- */
 router.post("/chat", async (req, res) => {
@@ -37,36 +46,86 @@ router.post("/chat", async (req, res) => {
 
     switch (provider) {
       case "anthropic": {
-        const key = process.env.ANTHROPIC_API_KEY;
-        if (!key) { res.status(503).json({ error: "Anthropic not configured", provider }); return; }
-        text = await sendAnthropic(key, model || "claude-opus-4-5", system, user, tools);
+        const directKey = process.env.ANTHROPIC_API_KEY;
+        const orKey = process.env.OPENROUTER_API_KEY;
+        if (directKey) {
+          // Direct Anthropic — supports web_search beta tool
+          text = await sendAnthropic(directKey, model || "claude-opus-4-5", system, user, tools);
+        } else if (orKey) {
+          // Via OpenRouter — best Claude model; web_search tool not forwarded (OR uses different schema)
+          text = await sendOpenAICompat(
+            "https://openrouter.ai/api/v1/chat/completions",
+            orKey,
+            orModel("anthropic", model || "claude-opus-4-5"),
+            system,
+            user,
+          );
+        } else {
+          res.status(503).json({ error: "Anthropic not configured", provider }); return;
+        }
         break;
       }
+
       case "openai": {
-        const key = process.env.OPENAI_API_KEY;
-        if (!key) { res.status(503).json({ error: "OpenAI not configured", provider }); return; }
-        text = await sendOpenAICompat("https://api.openai.com/v1/chat/completions", key, model || "gpt-4o", system, user);
+        const directKey = process.env.OPENAI_API_KEY;
+        const orKey = process.env.OPENROUTER_API_KEY;
+        if (directKey) {
+          text = await sendOpenAICompat(
+            "https://api.openai.com/v1/chat/completions",
+            directKey,
+            model || "gpt-4o",
+            system,
+            user,
+          );
+        } else if (orKey) {
+          text = await sendOpenAICompat(
+            "https://openrouter.ai/api/v1/chat/completions",
+            orKey,
+            orModel("openai", model || "gpt-4o"),
+            system,
+            user,
+          );
+        } else {
+          res.status(503).json({ error: "OpenAI not configured", provider }); return;
+        }
         break;
       }
+
       case "gemini": {
+        // Always direct — Gemini API key is configured
         const key = process.env.GEMINI_API_KEY;
         if (!key) { res.status(503).json({ error: "Gemini not configured", provider }); return; }
         text = await sendGemini(key, model || "gemini-1.5-flash", system, user);
         break;
       }
+
       case "groq": {
-        // xAI Grok — OpenAI-compatible endpoint
+        // Always direct via xAI — Grok API key is configured
         const key = process.env.GROK_API_KEY;
         if (!key) { res.status(503).json({ error: "Grok not configured", provider }); return; }
-        text = await sendOpenAICompat("https://api.x.ai/v1/chat/completions", key, model || "grok-3", system, user);
+        text = await sendOpenAICompat(
+          "https://api.x.ai/v1/chat/completions",
+          key,
+          model || "grok-3",
+          system,
+          user,
+        );
         break;
       }
+
       case "openrouter": {
         const key = process.env.OPENROUTER_API_KEY;
         if (!key) { res.status(503).json({ error: "OpenRouter not configured", provider }); return; }
-        text = await sendOpenAICompat("https://openrouter.ai/api/v1/chat/completions", key, model || "openai/gpt-4o-mini", system, user);
+        text = await sendOpenAICompat(
+          "https://openrouter.ai/api/v1/chat/completions",
+          key,
+          model || "openai/gpt-4o-mini",
+          system,
+          user,
+        );
         break;
       }
+
       default:
         res.status(400).json({ error: `Unknown provider: ${provider}`, provider });
         return;
@@ -93,7 +152,8 @@ async function sendAnthropic(
   tools?: unknown[],
 ): Promise<string> {
   const hasWebSearch = Array.isArray(tools) && tools.some(
-    (t: unknown) => typeof t === "object" && t !== null && (t as Record<string, unknown>).type === "web_search_20250305"
+    (t: unknown) => typeof t === "object" && t !== null &&
+      (t as Record<string, unknown>).type === "web_search_20250305",
   );
 
   const headers: Record<string, string> = {
