@@ -1,0 +1,2 @@
+/* ADEP uses inline styles exclusively. This file is intentionally minimal. */
+*, *::before, *::after { box-sizing: border-box; }
