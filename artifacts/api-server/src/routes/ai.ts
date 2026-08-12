@@ -1,17 +1,19 @@
 import { Router, type IRouter } from "express";
 
 const router: IRouter = Router();
+const OPENROUTER_URL = "https://openrouter.ai/api/v1";
+const OPENROUTER_DEFAULT_MODEL = "openai/gpt-4o-mini";
+const OR_MODEL_CACHE_TTL = 60_000;
+let orModelCache: string[] | null = null;
+let orModelCacheTs = 0;
 
 /* ---- Which providers are configured ---- */
 function getAvailableProviders(): string[] {
   const hasOR = !!process.env.OPENROUTER_API_KEY;
   const out: string[] = [];
-  // anthropic and openai route through OpenRouter when direct keys have no credits
-  if (process.env.ANTHROPIC_API_KEY || hasOR) out.push("anthropic");
-  if (process.env.OPENAI_API_KEY || hasOR) out.push("openai");
-  if (process.env.GEMINI_API_KEY) out.push("gemini");
-  if (process.env.GROK_API_KEY) out.push("groq");
-  if (hasOR) out.push("openrouter");
+  if (hasOR) {
+    out.push("anthropic", "openai", "gemini", "groq", "openrouter");
+  }
   return out;
 }
 
@@ -24,6 +26,152 @@ router.get("/providers", (_req, res) => {
 // Prepend a provider prefix for OpenRouter if the model id has no slash.
 function orModel(provider: string, model: string): string {
   return model.includes("/") ? model : `${provider}/${model}`;
+}
+
+function normalizeOpenRouterModel(provider: string, model?: string): string {
+  const requested = model && model.trim() ? model.trim() : undefined;
+  switch (provider) {
+    case "anthropic": return orModel("anthropic", requested || "claude-opus-4-5");
+    case "openai": return orModel("openai", requested || "gpt-4o");
+    case "gemini": return orModel("google", requested || "gemini-1.5-flash");
+    case "groq": return orModel("xai", requested || "grok-3");
+    case "openrouter": return requested || OPENROUTER_DEFAULT_MODEL;
+    default: return requested || OPENROUTER_DEFAULT_MODEL;
+  }
+}
+
+function fallbackModelCandidates(provider: string, requestedModel: string): string[] {
+  const list: string[] = [requestedModel];
+  switch (provider) {
+    case "anthropic":
+      list.push("anthropic/claude-opus-4-5", "anthropic/claude-3.7-sonnet", "openai/gpt-4o-mini", "openai/gpt-4o");
+      break;
+    case "openai":
+      list.push("openai/gpt-4o", "openai/gpt-4o-mini", "anthropic/claude-opus-4-5");
+      break;
+    case "gemini":
+      list.push("google/gemini-1.5-flash", "openai/gpt-4o-mini", "openai/gpt-4o");
+      break;
+    case "groq":
+      list.push("xai/grok-3", "openai/gpt-4o-mini", "openai/gpt-4o");
+      break;
+    case "openrouter":
+      list.push("openai/gpt-4o-mini", "openai/gpt-4o", "anthropic/claude-opus-4-5");
+      break;
+    default:
+      list.push("openai/gpt-4o-mini", "openai/gpt-4o");
+  }
+  return [...new Set(list.filter(Boolean))];
+}
+
+async function fetchOpenRouterModels(key: string): Promise<string[]> {
+  if (orModelCache && Date.now() - orModelCacheTs < OR_MODEL_CACHE_TTL) return orModelCache;
+  const res = await fetch(`${OPENROUTER_URL}/models`, {
+    method: "GET",
+    headers: { Authorization: `Bearer ${key}` },
+  });
+  if (!res.ok) {
+    throw new Error(`OpenRouter models ${res.status}: ${res.statusText}`);
+  }
+  const data = await res.json() as { models?: Array<{ id?: string }> };
+  orModelCache = Array.isArray(data.models)
+    ? data.models.map((m) => String(m.id || "").trim()).filter(Boolean)
+    : [];
+  orModelCacheTs = Date.now();
+  return orModelCache;
+}
+
+async function chooseOpenRouterModel(provider: string, model?: string, key?: string): Promise<string> {
+  const requested = normalizeOpenRouterModel(provider, model);
+  if (!key) return requested;
+  try {
+    const available = await fetchOpenRouterModels(key);
+    if (available.includes(requested)) return requested;
+    const candidates = fallbackModelCandidates(provider, requested);
+    const match = candidates.find((m) => available.includes(m));
+    return match || requested;
+  } catch {
+    return requested;
+  }
+}
+
+function isRecoverableOpenRouterError(err: any): boolean {
+  const msg = err?.message || "";
+  return /429|500|502|503|504|rate limit|unavailable|timed out|model not found|invalid model/i.test(msg);
+}
+
+function isToolUnsupportedOpenRouterError(err: any): boolean {
+  const msg = err?.message || "";
+  return /tool|tools|unsupported|not supported|unknown tool|unrecognized tool/i.test(msg);
+}
+
+async function sendOpenRouterChat(
+  key: string,
+  model: string,
+  system: string,
+  user: string,
+  tools?: unknown[],
+): Promise<string> {
+  const body: Record<string, unknown> = {
+    model,
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+    max_tokens: 1000,
+  };
+  if (tools && tools.length > 0) body.tools = tools;
+
+  const res = await fetch(`${OPENROUTER_URL}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${key}`,
+    },
+    body: JSON.stringify(body),
+  });
+
+  const data = await res.json() as Record<string, unknown>;
+  if (!res.ok) {
+    const err = data.error as Record<string, string> | undefined;
+    throw new Error(`${res.status}: ${err?.message || err?.type || res.statusText}`);
+  }
+
+  const choices = data.choices as Array<Record<string, unknown>> | undefined;
+  const msg = choices?.[0]?.message as Record<string, string> | undefined;
+  const text = msg?.content;
+  if (!text) throw new Error("Empty response from OpenRouter");
+  return text;
+}
+
+async function tryOpenRouterChatWithFallback(
+  key: string,
+  provider: string,
+  model: string,
+  system: string,
+  user: string,
+  tools?: unknown[],
+): Promise<string> {
+  const candidateModels = fallbackModelCandidates(provider, model);
+  let lastError: unknown;
+
+  for (const candidate of candidateModels) {
+    try {
+      return await sendOpenRouterChat(key, candidate, system, user, tools);
+    } catch (err: unknown) {
+      lastError = err;
+      if (tools && isToolUnsupportedOpenRouterError(err)) {
+        try {
+          return await sendOpenRouterChat(key, candidate, system, user, undefined);
+        } catch (err2: unknown) {
+          lastError = err2;
+        }
+      }
+      if (!isRecoverableOpenRouterError(err)) break;
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
 /* ---- AI proxy ---- */
@@ -42,94 +190,20 @@ router.post("/chat", async (req, res) => {
   }
 
   try {
-    let text: string;
-
-    switch (provider) {
-      case "anthropic": {
-        const directKey = process.env.ANTHROPIC_API_KEY;
-        const orKey = process.env.OPENROUTER_API_KEY;
-        if (directKey) {
-          // Direct Anthropic — supports web_search beta tool
-          text = await sendAnthropic(directKey, model || "claude-opus-4-5", system, user, tools);
-        } else if (orKey) {
-          // Via OpenRouter — best Claude model; web_search tool not forwarded (OR uses different schema)
-          text = await sendOpenAICompat(
-            "https://openrouter.ai/api/v1/chat/completions",
-            orKey,
-            orModel("anthropic", model || "claude-opus-4-5"),
-            system,
-            user,
-          );
-        } else {
-          res.status(503).json({ error: "Anthropic not configured", provider }); return;
-        }
-        break;
-      }
-
-      case "openai": {
-        const directKey = process.env.OPENAI_API_KEY;
-        const orKey = process.env.OPENROUTER_API_KEY;
-        if (directKey) {
-          text = await sendOpenAICompat(
-            "https://api.openai.com/v1/chat/completions",
-            directKey,
-            model || "gpt-4o",
-            system,
-            user,
-          );
-        } else if (orKey) {
-          text = await sendOpenAICompat(
-            "https://openrouter.ai/api/v1/chat/completions",
-            orKey,
-            orModel("openai", model || "gpt-4o"),
-            system,
-            user,
-          );
-        } else {
-          res.status(503).json({ error: "OpenAI not configured", provider }); return;
-        }
-        break;
-      }
-
-      case "gemini": {
-        // Always direct — Gemini API key is configured
-        const key = process.env.GEMINI_API_KEY;
-        if (!key) { res.status(503).json({ error: "Gemini not configured", provider }); return; }
-        text = await sendGemini(key, model || "gemini-1.5-flash", system, user);
-        break;
-      }
-
-      case "groq": {
-        // Always direct via xAI — Grok API key is configured
-        const key = process.env.GROK_API_KEY;
-        if (!key) { res.status(503).json({ error: "Grok not configured", provider }); return; }
-        text = await sendOpenAICompat(
-          "https://api.x.ai/v1/chat/completions",
-          key,
-          model || "grok-3",
-          system,
-          user,
-        );
-        break;
-      }
-
-      case "openrouter": {
-        const key = process.env.OPENROUTER_API_KEY;
-        if (!key) { res.status(503).json({ error: "OpenRouter not configured", provider }); return; }
-        text = await sendOpenAICompat(
-          "https://openrouter.ai/api/v1/chat/completions",
-          key,
-          model || "openai/gpt-4o-mini",
-          system,
-          user,
-        );
-        break;
-      }
-
-      default:
-        res.status(400).json({ error: `Unknown provider: ${provider}`, provider });
-        return;
+    const key = process.env.OPENROUTER_API_KEY;
+    if (!key) {
+      res.status(503).json({ error: "OpenRouter not configured", provider });
+      return;
     }
+
+    const supportedProviders = ["anthropic", "openai", "gemini", "groq", "openrouter"];
+    if (!supportedProviders.includes(provider)) {
+      res.status(400).json({ error: `Unknown provider: ${provider}`, provider });
+      return;
+    }
+
+    const normalizedModel = await chooseOpenRouterModel(provider, model, key);
+    const text = await tryOpenRouterChatWithFallback(key, provider, normalizedModel, system, user, tools);
 
     res.json({ text });
   } catch (err: unknown) {

@@ -306,6 +306,35 @@ const PROVIDERS = [
 ];
 const PROV = (id: string) => PROVIDERS.find((p) => p.id === id) || PROVIDERS[0];
 
+function orModel(provider: string, model: string): string {
+  return model.includes("/") ? model : `${provider}/${model}`;
+}
+
+function chooseSeatModel(providerCfg: any, modeId: string, research: boolean, seatId: string): string {
+  const requested = providerCfg?.model?.trim();
+  const provider = providerCfg?.id || "openrouter";
+
+  if (requested) {
+    if (provider === "openrouter" || requested.includes("/")) return requested;
+  }
+
+  const isResearch = research || ["deep", "invest", "science", "war"].includes(modeId);
+  switch (provider) {
+    case "anthropic":
+      return orModel("anthropic", requested || (isResearch ? "claude-3.7-sonnet" : "claude-opus-4-5"));
+    case "openai":
+      return orModel("openai", requested || (isResearch ? "gpt-4o" : "gpt-4o-mini"));
+    case "gemini":
+      return orModel("google", requested || "gemini-1.5-flash");
+    case "groq":
+      return orModel("xai", requested || "grok-3");
+    case "openrouter":
+      return requested || "openai/gpt-4o-mini";
+    default:
+      return requested || "openai/gpt-4o-mini";
+  }
+}
+
 /* ================= PERSISTENCE — localStorage ================= */
 const store = {
   get(k: string): any {
@@ -318,7 +347,7 @@ const store = {
 
 /* ================= AI PROXY — all calls go through the backend ================= */
 async function providerSend(system: string, user: string, tools: unknown[] | undefined, cfg: any): Promise<string> {
-  const id = (cfg && cfg.id) || "anthropic";
+  const id = (cfg && cfg.id) || "openrouter";
   try {
     const res = await fetch("/api/ai/chat", {
       method: "POST",
@@ -349,7 +378,7 @@ async function providerSend(system: string, user: string, tools: unknown[] | und
 }
 
 async function askJSON(system: string, user: string, tools: unknown[] | undefined, cfg: any): Promise<any> {
-  const providerCfg = cfg || { id: "anthropic" };
+  const providerCfg = cfg || { id: "openrouter" };
   let raw: string;
   try {
     raw = await providerSend(system, user, tools, providerCfg);
@@ -416,7 +445,7 @@ function useCouncil() {
     setPhase("running"); setFeed([]); setLinks([]); setOptions(null); setReport(null); setErrMsg(null);
     setQText(question); setModeId(mId); setActive(null);
     const mode = MODES.find((m) => m.id === mId) || MODES[0];
-    providerCfg = providerCfg || { id: "anthropic" };
+    providerCfg = providerCfg || { id: "openrouter" };
     resolveExpertProvider = resolveExpertProvider || (() => null);
     argsRef.current = { question, mId, pins, research, providerCfg, resolveExpertProvider };
     recRef.current = { id: uid(), ts: Date.now(), q: question, modeId: mId, research, providerId: providerCfg.id, feed: [], report: null, options: null, seatIds: [], seatProviders: {}, confs: {} };
@@ -450,7 +479,11 @@ function useCouncil() {
       seatIds.forEach((id) => {
         const meta = EX(id);
         const resolved = (meta as any).pref ? resolveExpertProvider((meta as any).pref) : null;
-        seatProviders[id] = resolved || providerCfg;
+        const baseCfg = resolved || providerCfg;
+        seatProviders[id] = {
+          id: baseCfg.id,
+          model: chooseSeatModel(baseCfg, mId, research, id),
+        };
       });
       recRef.current.seatIds = seatIds;
       recRef.current.seatProviders = Object.fromEntries(Object.entries(seatProviders).map(([k, v]: [string, any]) => [k, v.id]));
@@ -539,7 +572,7 @@ function useCouncil() {
       /* Stage 6 — Evidence review */
       const factSeated = seatIds.includes("fact");
       const factCfg = factSeated ? (seatProviders["fact"] || providerCfg) : providerCfg;
-      const canSearch = research && factCfg.id === "anthropic";
+      const canSearch = research && factSeated;
       setStageIdx(5); setBusy(factSeated ? (canSearch ? "Fact checker researching live" : "Fact checker reviewing claims") : "Verifying key claims");
       mark("Evidence review");
       if (factSeated) { seat("fact", { status: "thinking" }); setActive("fact"); }
@@ -1129,7 +1162,7 @@ function ReportView({ r, options, onFollow }: any) {
 
 /* ================= PROVIDER CONFIG — server-side keys ================= */
 function useProviderConfig() {
-  const [providerId, setProviderId] = useState("anthropic");
+  const [providerId, setProviderId] = useState("openrouter");
   const [models, setModels] = useState<Record<string, string>>({});
   const [availableIds, setAvailableIds] = useState<string[]>([]);
   const [serverLoaded, setServerLoaded] = useState(false);
@@ -1156,7 +1189,7 @@ function useProviderConfig() {
         }
         setServerLoaded(true);
       })
-      .catch(() => { setAvailableIds(["anthropic"]); setServerLoaded(true); });
+      .catch(() => { setAvailableIds(["openrouter"]); setServerLoaded(true); });
   }, []);
 
   useEffect(() => {
